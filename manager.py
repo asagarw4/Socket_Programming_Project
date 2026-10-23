@@ -1,179 +1,393 @@
 from socket import*
-import os, sys
-import pandas as pd
-import numpy as np
+import sys
 import json
 import random
-import math
-import threading
 
-listening_port = sys.argv[1]
-socket = socket(AF_INET, SOCK_DGRAM)
-socket.bind('', listening_port)
+class Manager:
+    def __init__(self, port):
+        self.listening_port = int(port)
+        self.socket = socket(AF_INET, SOCK_DGRAM)
+        self.handlers = {"register": self.register, "setup-dht": self.setupdht, "dht-complete": self.dhtcomplete, "query-dht": self.querydht, "join-dht": self.joindht, "dht-rebuilt": self.dhtrebuilt, "leave-dht": self.leavedht}
+        
+        #Important DHT state info
+        self.DHT_setup = "TO DO"
+        self.peer_joining = None
+        self.peer_leaving = None
+        
+        #DHT meta info
+        self.leader_name = ""
+        self.leader_addr = ""
+        self.peer_state = {} # keys are peernames, values are lists [state, IPV4 addr, m-port, p-port]
+        self.DHT_members = [] #list to be sent to the leader during setup-dht
+        self.DHT_num_members = None
+        self.DHT_year = None
 
-DHT_setup = "TO DO"
-Leader = ""
-peer_state = {} # keys are peernames, values are tuples (state, IPV4 addr, m-port, p-port)
-DHT_members = [] #list to be sent to the leader during setup-dht
+        #manager port tracking
+        self.requests = {}
+        self.clientAddr = ""
+        self.msg_recv = None #latest msg received at listening port
+        self.msg_to_send = None #latest message to be sent
+        self.mseq = -1
 
-requests_received = {}
+    def register(self):
+        peer_name = self.msg_recv.get("peername")
+        ipv4 = self.msg_recv.get("ipv4") #string object, "100.10.10.1" or host name
+        mport = self.msg_recv.get("mport")
+        pport = self.msg_recv.get("pport")
 
-def register(msg, peer_state):
-    peer_name = msg.get("peername")
-    ipv4 = msg.get("ipv4") #string object, "100.10.10.1" or host name
-    mport = msg.get("mport")
-    pport = msg.get("pport")
-
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
     #check if all the fields are present
-    if not peer_name or not ipv4 or not mport or not pport: 
-        print('required register msg fields not present')
-        msg_to_send = {"status_code": "INVALID"}
-        return msg_to_send
-
+        if not peer_name or not ipv4 or not mport or not pport: 
+            print('required register msg fields not present')
+            self.msg_to_send.update(status_code="INVALID")
+            self.send()
+            return
+    #ensure mport and pport are integers
+        mport = int(mport)
+        pport = int(pport)
+    
     #ensure uniqueness of peer name
-    if (peer_state.get(peer_name)):  
-        msg_to_send = {"status_code": "DUPLICATE"}
-        print('PEER ALREADY REGISTERED!')
-        return msg_to_send
+        if (self.peer_state.get(peer_name)):  
+            self.msg_to_send.update(status_code="DUPLICATE")
+            print('PEER ALREADY REGISTERED!')
+            self.send()
+            return
 
     #ensure uniqueness of pport and mport
-    for i,v in enumerate(peer_state):
-        if v[2] == "mport" or v[3] == "pport":
-            msg_to_send = {"status_code": "DUPLICATE"}
-            print('PORT ALREADY IN USE!')
-            return msg_to_send
+        for v in self.peer_state.values():
+            if v[2] == mport or v[3] == pport:
+                self.msg_to_send.update(status_code="DUPLICATE")
+                print('PORT ALREADY IN USE!')
+                self.send()
+                return
 
-    #So, status:v[0], ipv4_byte_object:v[1], mport:v[2], pport:[v3]
-    peer_state.update(peer_name=("Free", ipv4, mport, pport))
-    msg_to_send = {"status_code": "SUCCESS"}
-    return msg_to_send
+        #So, status:v[0], ipv4_byte_object:v[1], mport:v[2], pport:[v3]
+        self.peer_state.update({peer_name: ["Free", ipv4, mport, pport]})
+        self.msg_to_send.update(status_code="SUCCESS")
+        print(f'command handled, returning status code of SUCCESS')  
+        self.send()
 
-def setupdht(msg):
-    leader_name = msg.get("peername")
-    n = msg.get("n")
-    year = msg.get("year")
+    def setupdht(self):
+        name = self.msg_recv.get("peername")
+        n = self.msg_recv.get("n")
+        year = self.msg_recv.get("year")
 
-    #check if all the fields are present
-    if not leader_name or not n or not year: 
-        msg_to_send = {"status_code": "INVALID"}
-        print('required setup-dhtmsg fields not present')
-        return msg_to_send
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        #check if all the fields are present
+        if not name or not n or not year: 
+            self.msg_to_send.update(status_code="INVALID")
+            print('required setup-dht msg fields not present')
+            self.send()
+            return
     
-    leader_state = peer_state.get(leader_name)
-    if not leader_state:
-        msg_to_send = {"status_code": "FAILURE"}
-        print('Leader name not registered!')  
-        return msg_to_send
+        state = self.peer_state.get(name)
+        if not state:
+            self.msg_to_send.update(status_code="FAILURE")
+            print('Leader name not registered!') 
+            self.send() 
+            return
     
-    if n < 3:
-        msg_to_send = {"status_code": "FAILURE"}
-        print('minimum size of DHT is 3!')
-        return msg_to_send
-    
-    if len(peer_state) < n:
-        msg_to_send = {"status_code": "FAILURE"}
-        print('not enough peers have registered yet!')
-        return msg_to_send
+        if n < 3:
+            self.msg_to_send.update(status_code="FAILURE")
+            print('minimum size of DHT is 3!')
+            self.send()
+            return
+        
+        if len(self.peer_state) < n:
+            self.msg_to_send.update(status_code="FAILURE")
+            print('not enough peers have registered yet!')
+            self.send()
+            return
+        
+        if self.DHT_setup != "TO DO":
+            self.msg_to_send.update(status_code="DUPLICATE") #Meant to indicate that FILURE was caused by DHT already having bee nsetup 
+            print('DHT already setup or is in progress!')  
+            self.send()
+            return
 
-    if DHT_setup:
-        msg_to_send = {"status_code": "DUPLICATE"} #Meant to indicate that FILURE was caused by DHT already having bee nsetup 
-        print('DHT already setup!')
-        return msg_to_send       
+        if not (state[1], state[2]) == self.clientAddr:
+            self.msg_to_send.update(status_code="INVALID")
+            print('Ambiguity in leader address, registration record does not match setupdht clientAddr!')
+            self.send()
+            return
 
-    #Manage leader state, addr, info
-    leader_state = peer_state.get(leader_name) 
-    leader_addr = (leader_state[1], leader_state[2]) #(ipv4, m-PORT)
-    leader_state[0] = "Leader"                   #change status from 'Free' to 'Leader'
-    peer_state.update(leader_name=leader_state) #Updating leader status
-    DHT_members.append((leader_name, leader_state[1], leader_state[3])) #adding leader tuple to list
-    
-    #Form the DHT_members 3-tuple list
-    member_name_list = random.sample(list(peer_state), n-1)
-    for name in member_name_list:
-        v = peer_state.get(name)
-        DHT_members.append((name, v[1], v[3]))
+        #All checks passed, Manage leader state, addr, info
+        self.leader_name = name
+        self.leader_addr = (state[1], state[2])
+        state[0] = "Leader" #change status from 'Free' to 'Leader'
+        self.peer_state.update({name: state}) #Updating leader status
 
-    global DHT_setup
-    DHT_setup = "IN PROGRESS"
-    msg_to_send = {"status_code": 'SUCCESS', "memberlist": DHT_members[:20]} #sending first 20 members.
-    return msg_to_send
+        self.DHT_members = [] #ensuring setup is new
+        self.DHT_members.append((name, state[1], state[3])) #adding leader tuple to list
+        free_peers = [name for name,v in self.peer_state.items() if name != self.leader_name and v[0]=="Free"] 
+        #Form the DHT_members 3-tuple list
+        member_name_list = random.sample(free_peers, n-1) 
+        print(member_name_list)
+        for name in member_name_list:
+            v = self.peer_state.get(name)
+            print(v)
+            v[0] = 'InDHT'
+            self.peer_state.update({name: v}) #change member state to InDHT
+            self.DHT_members.append((name, v[1], v[3])) #appending chosen member tuples to DHT_members list
 
-def dhtcomplete(msg):
-    leader_name = msg.get("peername")
-    leader_state = DHT_members[0]
-    if leader_name == leader_state[0]:
-        global DHT_setup
-        DHT_setup = "Done"
-        msg_to_send = {"status_code": "SUCCESS"}
-    else:
-        msg_to_send = {"status_code": "FAILURE"}
-        print('dht-complete needs leader name!')
-    return msg_to_send
-    
+        self.DHT_setup = "IN PROGRESS"
+        self.msg_to_send.update(status_code='SUCCESS')
+        self.msg_to_send.update(memberlist=self.DHT_members[:20])  #sending only first 20 members.
+        print(f'setupdht command handled, returning status code of SUCCESS')  
+        self.send()
+        
+    def dhtcomplete(self):
+        name = self.msg_recv.get("peername")
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        if self.clientAddr != self.leader_addr:
+            print("dht-complete recevied from peer other than manager, usage issue, ignore command")
+            return
+        if name != self.leader_name:
+            self.msg_to_send.update(status_code="FAILURE")
+            print('dht-complete needs leader name!')
+            self.send()
+            return
+        self.DHT_setup = "DONE"
+        self.msg_to_send.update(status_code="SUCCESS")
+        print('dht-complete received with leader-name, sending SUCCESS msg to leader')
+        self.send()
 
-handlers = {"register": register, "setup-dht": setupdht, "dht-complete": dhtcomplete}
-setupdht_request = None
+    def querydht(self):
+        name = self.msg_recv.get("peername")
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        
+        if not self.DHT_setup == "DONE":
+            print('DHT setup not completed, cannot support query!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
 
-while True:
-    message, clientAddress = socket.recvfrom(1000)
+        peer_state = self.peer_state.get(name)
+        if not peer_state:
+            print('Peer making query is not registered!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
 
-    try: #For debugging, incase it is JSON conversion that causes problems
-        msg_json = json.loads(message.decode('utf-8'))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        print(f'error caused by JSON conversio of message: {message}')
-        status_code = "CORRUPTION" #msg corrupted, ignore
-        continue
+        peer_status = peer_state[0]
+        if not peer_status == 'Free':
+            print('Peer making query is not Free!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()  
+            return 
 
-    request = (message, clientAddress)
-    if request in list(requests_received):  #Handle duplicate requests by resending status_code [value of key]
-        print("Duplicate msg received, sending status_code again")
-        socket.sendto(requests_received[request], clientAddress)
-        continue   
+        self.msg_to_send.update(status_code="SUCCESS")
+        S_id = random.randrange(0, len(self.DHT_members))
+        self.msg_to_send.update(peer=self.DHT_members[S_id])
+        self.send()
+
+    def joindht(self):
+        self.peer_joining = None
+        name = self.msg_recv.get("peername")
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        
+        if not self.DHT_setup == "DONE":
+            print('DHT setup not completed, cannot support join!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        peer_state = self.peer_state.get(name)
+        if not peer_state:
+            print('Peer making join request is not registered!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        peer_status = peer_state[0]
+        if not peer_status == 'Free':
+            print('Peer making join request is not Free!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()  
+            return 
+
+        self.peer_joining = name
+        self.msg_to_send.update(status_code="SUCCESS")
+        S_id = random.randrange(0, len(self.DHT_members))
+        self.msg_to_send.update(peer=self.DHT_members[S_id]) 
+        #sends a random peer's (name, ipv4, pport) which joiner can make it's right neighbour 
+        #it can then send reset and teardown commands to this peer 
+        self.send()
+
+    def leavedht(self):
+        self.peer_leaving = None
+        name = self.msg_recv.get("peername")
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        
+        if not self.DHT_setup == "DONE":
+            print('DHT setup not completed, cannot support leave!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        peer_state = self.peer_state.get(name)
+        if not peer_state:
+            print('Peer making leave request is not registered!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        peer_status = peer_state[0]
+        if peer_status == 'Free':
+            print('Peer making leave request is not maintaining DHT!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()  
+            return 
+
+        self.peer_leaving = name
+        self.msg_to_send.update(status_code="SUCCESS")
+        self.send()     
+
+ 
+    def dhtrebuilt(self):
+        print('dht-rebuilt command received')
+        name = self.msg_recv.get("peername")
+        leader_name = self.msg_recv.get("leadername")
+
+        if not name or not leader_name:
+            print('Fields missing from dht-rebuilt, ignoring msg')
+            return
+
+        self.msg_to_send = {"status_code": "", "seq":self.mseq}
+        leader_state = self.peer_state.get(leader_name)
+        peer_state = self.peer_state.get(name)
+        if not(leader_state or peer_state):
+            print(f'leadername {leader_name} or peername {name} sent is not registered! sending failure')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        leader_id = -1
+        for i,v in enumerate(self.DHT_members):
+            if v[0] == leader_name:
+                leader_id = i
+                break
+        if (leader_id < 0):
+            print(f'leadername {leader_name} is not part of DHT! sending failure')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+
+        if name == self.peer_joining:
+            peer_state[0] = 'InDHT'
+            self.peer_state.update({name: peer_state})
+            peer_tuple = (name, peer_state[1], peer_state[3])
+
+            memberlist = self.DHT_members[leader_id:] #reordering memberlist
+            memberlist.extend(self.DHT_members[:leader_id])
+            memberlist.append(peer_tuple) #appending joint peer to member list
+            self.DHT_members = memberlist
+            self.DHT_num_members = self.DHT_num_members + 1
+
+            self.leader_name = leader_name
+            self.leader_addr = (leader_state[1], leader_state[2])
+            print('peer join successfully completed, clearing out blockade')
+            self.peer_joining = None
+        
+        elif name == self.peer_leaving:
+            peer_state[0] = 'Free'
+            self.peer_state.update({name: peer_state})
+            peer_tuple = (name, peer_state[1], peer_state[3])
+
+            memberlist = self.DHT_members[leader_id:] #reordering memberlist
+            memberlist.extend(self.DHT_members[:leader_id])
+            del_member = memberlist.pop() #removing leaving member
+            if del_member != peer_tuple:
+                print('CAUTION: leader_name not selected as expected, wrong member deleted!')
+            self.DHT_members = memberlist
+            self.DHT_num_members = self.DHT_num_members - 1
+
+            self.leader_name = leader_name
+            self.leader_addr = (leader_state[1], leader_state[2])
+            print('peer join successfully completed, clearing out blockade')
+            self.peer_leaving = None
+        else:
+            print('peername received is neither leaving nor joining!')
+            self.msg_to_send.update(status_code="FAILURE")
+            self.send()
+            return
+        
+        self.DHT_setup = "DONE"
+        self.msg_to_send.update(status_code="SUCCESS")
+        print('dht-rebuilt received with leader-name, sending SUCCESS msg to leader')
+        self.send()
 
 
-    seq = msg_json.get("seq")
-    command = msg_json.get("command")
-    if not seq or not command:
-            print('Sequence number is missing')
-            status_code = "CORRUPTION" 
-            continue #ignore msg if no seq number or no command
-    
-    
-    if DHT_setup == "IN PROGRESS":  #NManager waiting for dht-complete after setup-dht
-        leader_name = DHT_members[0][0]
-        leader_state = peer_state[leader_name]
-        leader_address = (leader_state[1], leader_state[2])
-           
-        if clientAddress == leader_address and command == "setupdht":  #event that designed nack for member_list
-            print('setupdht duplicate request not handled properly by manager or resend was corrupted')
-        elif clientAddress == leader_address and command == "dhtcomplete":
-            peer_name = msg_json.get("peername")
-            if not peer_name == leader_name:
-                print('Invalid dht-complete request made by leader, peer-name not leader-name')
+    def send(self):
+        print(f'sending msg: {self.msg_to_send} to {self.clientAddr}')
+        self.socket.sendto((json.dumps(self.msg_to_send)).encode('utf-8'), self.clientAddr)
+        #As manager neveinitiates the request, it does not update the seq number
+        #it is merely responding with the same seq number
+def main():
+    manager = Manager(sys.argv[1])
+    manager.socket.bind(('', manager.listening_port))
+    while True:
+        msg, clientAddr = manager.socket.recvfrom(1000)
+
+        try: #For debugging, incase it is JSON conversion that causes problems
+            manager.msg_recv = json.loads(msg.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            print(f'error caused by JSON conversio of message: {msg}')
+            continue #ignore corrupt msg
+
+        manager.clientAddr = clientAddr
+        seq = manager.msg_recv.get("seq")
+        command = manager.msg_recv.get("command")
+
+        #ignore msg if no seq number or no command
+        if seq is None or not command:
+            print('Either sequence number or command field is missing')
+            continue #Handle duplicate requests by resending response [value of request key in manager.requests dict]
+       
+        request = (manager.msg_recv, manager.clientAddr)
+        request_hash = (seq, manager.clientAddr)
+        if request_hash in manager.requests:
+            print("Duplicate msg received, sending status_code again")
+            manager.msg_to_send = manager.requests[request_hash] 
+            manager.send()
+            continue   
+
+        manager.mseq = seq
+        manager.msg_to_send = {"status_code": "", "seq":manager.mseq}
+        #Manager waiting for dht-complete after setup-dht
+        if manager.DHT_setup == "IN PROGRESS":
+            if clientAddr == manager.leader_addr:  #event that designed nack for member_list
+                if command == "setup-dht":
+                    print('setupdht duplicate request not handled properly by manager or resend was corrupted')
+                    continue
             else:
-                print(f'Sending FAILURE to request f{request} received while DHT_Setup IN PROGRESS') #any other request                                                  
-                msg_to_send = {"status_code": "FAILURE", "seq":seq}
-                socket.sendto((json.dumps(msg_to_send)).encode('utf-8'), clientAddress)
+                print(f'Sending FAILURE to request {request} received while DHT_Setup IN PROGRESS') #any other request                                                  
+                manager.msg_to_send.update(status_code="FAILURE")
+                manager.send()
+                continue
+
+        if manager.peer_joining or manager.peer_leaving: 
+            #trusting duplicate message handling here, can implement extra guard if need be
+            print(f'Sending FAILURE to request {request} received while DHT_Setup IN PROGRESS') #any other request                                                  
+            manager.msg_to_send.update(status_code="FAILURE")
+            manager.send()
             continue
-    
-    handler = handlers.get(command)   
-    if not handler:
-        print('command passed does not exist')
-        status_code = "INVALID"
-        msg_to_send = {"status_code": status_code, "seq":seq}
-        socket.sendto((json.dumps(msg_to_send).encode('utf-8')), clientAddress)
-        continue
 
-    msg_to_send = handler(msg_json)  
-    msg_to_send.update(seq=seq) #Update the msg to send with sequence number
+        handler = manager.handlers.get(command)
+        if not handler:
+            print('command passed does not exist')
+            manager.msg_to_send.update(status_code="INVALID")
+            manager.send()
+            continue
+        handler()  
 
-    print(f'command handled, returning status code of {msg_to_send[status_code]}')
-    print(f'sending msg: {msg_to_send} to {clientAddress}')  
-    socket.sendto((json.dumps(msg_to_send)).encode('utf-8'), clientAddress)
+        if len(manager.requests) >= 10:  #maximum ten old msgs to be stored of duplicate check
+            del manager.requests[next(iter(manager.requests))]
+        manager.requests.update({request_hash: manager.msg_to_send}) #buffer to allow server to recognize duplicate request
+        
+if __name__ == "__main__":
+    main()
 
-    if len(requests_received) >= 10:  #maximum ten old msgs to be stored of duplicate check
-        requests_received.popitem()
-    if not status_code == "CORRUPTION": #Policy decision: don't store requests that result in CORRUPTION status-code
-        requests_received.update(request=msg_to_send) #buffer to allow server to recognize duplicate request
+
         
 
