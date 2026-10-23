@@ -277,11 +277,12 @@ class Peer:
                 if (p // msgs_per_slot) % batch_size == 0:
                     time.sleep(0.001) #to avoid bursts of packets
             
-            sleep_time = 1*(n-i) #wait more for 1, as ACK will be sent through right neghbours
-            trials = 3
+            sleep_time = 1.5*(n-i) #wait more for 1, as ACK will be sent through right neghbours
+            trials = 5
+            time.sleep(2)
+            print(f'PEER {i} RECORDS----------------------')
             requests, responses = self.check_response_peer("store", requests, sleep_time, trials) #Needs ACK for each individual store msg, resends the unacked msg after timeout
             if requests:
-                print(f'PEER {i} RECORDS----------------------')
                 print(f'The following {requests} were not received by peer {i}, after {sleep_time} timeouts on each of {trials} trials')
                 NACK_peers.append(i)
             self.pport_recv_response.clear() #clear responses to make room for ACKs (~1350) from peer
@@ -344,8 +345,8 @@ class Peer:
                 break
             if requests:
                 for request in requests: #resend the requests for which no response was received
-                    print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
                     self.p_socket.sendto((json.dumps(request[0])).encode('utf-8'), request[1])
+                print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
 
         if requests:
             print(f'No response after waiting for {sleep_time}s, for all {trials}')
