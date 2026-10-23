@@ -332,6 +332,9 @@ class Manager:
         self.DHT_setup = "DONE"
         self.msg_to_send.update(status_code="SUCCESS")
         print(f'dht-rebuilt received with leader-name {leader_name}, sending SUCCESS msg to client')
+        print('Updated DHT memberlist:')
+        for i,v in enumerate(self.DHT_members):
+             print(f'Member {v[0]}: id {i}, ipv4 {v[1]}, pport {v[2]}, status:{self.peer_state[v[0]][0]}\n')
         self.send()
 
     def teardowndht(self):
@@ -392,7 +395,7 @@ class Manager:
             return
         del self.peer_state[peername]
         self.msg_to_send.update(status_code="SUCCESS")
-        print('deregister received with leader-name, sending SUCCESS msg to leader')
+        print(f'deregister received with {peername}, sending SUCCESS msg to peer')
         self.send()           
 
     def send(self):
