@@ -896,7 +896,7 @@ class Peer:
 
     def deregister(self, CLI_list): #on main thread
         if not len(CLI_list) == 2:
-            print('teardown-dht needs 1 command line parameters')
+            print('deregister needs 1 command line parameters')
             return
         name = CLI_list[1]
         if not name == self.name:
