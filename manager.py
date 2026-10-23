@@ -31,6 +31,7 @@ class Manager:
         self.mseq = -1
 
     def register(self):
+        print('Handling registration:')
         peer_name = self.msg_recv.get("peername")
         ipv4 = self.msg_recv.get("ipv4") #string object, "100.10.10.1" or host name
         mport = self.msg_recv.get("mport")
@@ -65,10 +66,11 @@ class Manager:
         #So, status:v[0], ipv4_byte_object:v[1], mport:v[2], pport:[v3]
         self.peer_state.update({peer_name: ["Free", ipv4, mport, pport]})
         self.msg_to_send.update(status_code="SUCCESS")
-        print(f'command handled, returning status code of SUCCESS')  
+        print(f'register command from {peer_name} handled, returning status code of SUCCESS')  
         self.send()
 
     def setupdht(self):
+        print('Handling setupdht')
         name = self.msg_recv.get("peername")
         n = self.msg_recv.get("n")
         year = self.msg_recv.get("year")
@@ -123,14 +125,13 @@ class Manager:
         free_peers = [name for name,v in self.peer_state.items() if name != self.leader_name and v[0]=="Free"] 
         #Form the DHT_members 3-tuple list
         member_name_list = random.sample(free_peers, n-1) 
-        print(member_name_list)
-        for name in member_name_list:
+        print ('Randomly chosen members of DHT are:\n')
+        for i, name in enumerate(member_name_list):
             v = self.peer_state.get(name)
-            print(v)
             v[0] = 'InDHT'
             self.peer_state.update({name: v}) #change member state to InDHT
             self.DHT_members.append((name, v[1], v[3])) #appending chosen member tuples to DHT_members list
-
+            print(f'Member {name}: id {i}, ipv4 {v[1]}, pport {v[3]}\n')
         self.DHT_num_members = len(self.DHT_members)
         self.DHT_setup = "IN PROGRESS"
         self.msg_to_send.update(status_code='SUCCESS')
@@ -139,6 +140,7 @@ class Manager:
         self.send()
         
     def dhtcomplete(self):
+        print('Handling dhtcomplete')
         name = self.msg_recv.get("peername")
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
         if self.clientAddr != self.leader_addr:
@@ -155,25 +157,26 @@ class Manager:
         self.send()
 
     def querydht(self):
+        print('Handling query')
         name = self.msg_recv.get("peername")
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
         
         if not self.DHT_setup == "DONE":
-            print('DHT setup not completed, cannot support query!')
+            print('DHT setup not completed, cannot support query! sending FAILURE')
             self.msg_to_send.update(status_code="FAILURE")
             self.send()
             return
 
         peer_state = self.peer_state.get(name)
         if not peer_state:
-            print('Peer making query is not registered!')
+            print('Peer making query is not registered! sending FAILURE')
             self.msg_to_send.update(status_code="FAILURE")
             self.send()
             return
 
         peer_status = peer_state[0]
         if not peer_status == 'Free':
-            print('Peer making query is not Free!')
+            print('Peer making query is not Free! sending FAILURE')
             self.msg_to_send.update(status_code="FAILURE")
             self.send()  
             return 
@@ -181,9 +184,11 @@ class Manager:
         self.msg_to_send.update(status_code="SUCCESS")
         S_id = random.randrange(0, len(self.DHT_members))
         self.msg_to_send.update(peer=self.DHT_members[S_id])
+        print(f'query handled successfully, returning success msg along with random peer id {S_id} info {self.DHT_members[S_id]}')
         self.send()
 
     def joindht(self):
+        print('Handling join-dht')
         self.peer_joining = None
         name = self.msg_recv.get("peername")
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
@@ -213,10 +218,12 @@ class Manager:
         S_id = random.randrange(0, len(self.DHT_members))
         self.msg_to_send.update(peer=self.DHT_members[S_id]) 
         #sends a random peer's (name, ipv4, pport) which joiner can make it's right neighbour 
-        #it can then send reset and teardown commands to this peer 
+        #it can then send reset and teardown commands to this peer
+        print(f'joindht from {name} handled, returning success msg along with random peer id {S_id} info {self.DHT_members[S_id]}\n Waiting for dht-rebuilt')
         self.send()
 
     def leavedht(self):
+        print('Handling leave-dht')
         self.peer_leaving = None
         name = self.msg_recv.get("peername")
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
@@ -243,6 +250,7 @@ class Manager:
 
         self.peer_leaving = name
         self.msg_to_send.update(status_code="SUCCESS")
+        print(f'leave-dht from {name} handled, sending uccess msg\n Waiting for dht-rebuilt')
         self.send()     
 
  
@@ -313,7 +321,7 @@ class Manager:
             self.leader_addr = (leader_state[1], leader_state[2])
             leader_state[0] = 'Leader'
             self.peer_state.update({leader_name: leader_state})
-            print('peer join successfully completed, clearing out blockade')
+            print('peer leave successfully completed, clearing out blockade')
             self.peer_leaving = None
         else:
             print('peername received is neither leaving nor joining!')
@@ -323,10 +331,11 @@ class Manager:
         
         self.DHT_setup = "DONE"
         self.msg_to_send.update(status_code="SUCCESS")
-        print('dht-rebuilt received with leader-name, sending SUCCESS msg to leader')
+        print(f'dht-rebuilt received with leader-name {leader_name}, sending SUCCESS msg to client')
         self.send()
 
     def teardowndht(self):
+        print('Handling teardown')
         peername = self.msg_recv.get('peername')
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
         if not peername == self.leader_name:
@@ -336,10 +345,11 @@ class Manager:
             return
         self.tearing_dht = True
         self.msg_to_send.update(status_code="SUCCESS")
-        print('teardown-dht received with leader-name, sending SUCCESS msg to leader')
+        print(f'teardown-dht received with leader-name {peername}, sending SUCCESS msg to leader')
         self.send()
         
     def teardowncomplete(self):
+        print('Handling teardowncomplete')
         peername = self.msg_recv.get('peername')
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
         if not peername == self.leader_name:
@@ -362,10 +372,11 @@ class Manager:
         self.leader_addr = None
 
         self.msg_to_send.update(status_code="SUCCESS")
-        print('teardown-complete received with leader-name, sending SUCCESS msg to leader')
+        print(f'teardown-complete received with leader-name {peername}, sending SUCCESS msg to leader')
         self.send()        
 
     def deregister(self):
+        print('Handling deregistration')
         peername = self.msg_recv.get('peername')
         self.msg_to_send = {"status_code": "", "seq":self.mseq}
         peer_state = self.peer_state.get(peername)
@@ -385,13 +396,14 @@ class Manager:
         self.send()           
 
     def send(self):
-        print(f'sending msg: {self.msg_to_send} to {self.clientAddr}')
+      #  print(f'sending msg: {self.msg_to_send} to {self.clientAddr}')
         self.socket.sendto((json.dumps(self.msg_to_send)).encode('utf-8'), self.clientAddr)
         #As manager neveinitiates the request, it does not update the seq number
         #it is merely responding with the same seq number
 def main():
     manager = Manager(sys.argv[1])
     manager.socket.bind(('', manager.listening_port))
+    print(f'Manager process started. Listening at port {manager.listening_port}:')
     while True:
         msg, clientAddr = manager.socket.recvfrom(1000)
 
@@ -461,6 +473,10 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+    
+    
 
         
 
