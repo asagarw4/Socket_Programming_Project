@@ -13,8 +13,8 @@ class Peer:
         self.manager_addr = manager_addr
         self.m_socket = socket(AF_INET, SOCK_DGRAM)
         self.p_socket = socket(AF_INET, SOCK_DGRAM)
-        self.m_handlers = {"register": self.register, "setup-dht": self.setupdht, "query-dht": self.querydht, "join-dht": self.joindht, "leave-dht": self.leavedht}
-        self.p_handlers = {"setid": self.setid, "store": self.store, "find-event":self.find_event, "reset-id":self.resetid, "teardown":self.teardown, "rebuild-dht":self.rebuilddht()}
+        self.m_handlers = {"register": self.register, "setup-dht": self.setupdht, "query-dht": self.querydht, "join-dht": self.joindht, "leave-dht": self.leavedht, "teardown-dht": self.teardowndht, "deregister":self.deregister}
+        self.p_handlers = {"setid": self.setid, "store": self.store, "find-event":self.find_event, "reset-id":self.resetid, "teardown":self.teardown, "rebuild-dht":self.start_rebuild_thread}
         self.m_seq = random.randrange(2**15)
         self.p_seq = random.randrange(2**15)
         
@@ -275,11 +275,13 @@ class Peer:
                 p = p+msgs_per_slot
                 
                 if (p // msgs_per_slot) % batch_size == 0:
-                    time.sleep(0.005) #to avoid bursts of packets
+                    time.sleep(0.001) #to avoid bursts of packets
+            
             sleep_time = 1*(n-i) #wait more for 1, as ACK will be sent through right neghbours
             trials = 3
             requests, responses = self.check_response_peer("store", requests, sleep_time, trials) #Needs ACK for each individual store msg, resends the unacked msg after timeout
             if requests:
+                print(f'PEER {i} RECORDS----------------------')
                 print(f'The following {requests} were not received by peer {i}, after {sleep_time} timeouts on each of {trials} trials')
                 NACK_peers.append(i)
             self.pport_recv_response.clear() #clear responses to make room for ACKs (~1350) from peer
@@ -338,6 +340,8 @@ class Peer:
                         break #response matched with a request, move onto next response
                             
             trials_left = trials_left - 1
+            if (trials_left < 0):
+                break
             if requests:
                 for request in requests: #resend the requests for which no response was received
                     print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
@@ -600,55 +604,76 @@ class Peer:
         if status_code != "SUCCESS": 
             print('Failed to join DHT, quitting')
             return
+
         rn_tuple = self.mport_msg_received["peer"]
         self.DHT_rn_name = rn_tuple[0]
         self.DHT_rn_addr = (rn_tuple[1], rn_tuple[2])
 
+        msg_recv = self.initiate_resetid(op="join")
+        if not msg_recv or  not msg_recv["status_code"] == "SUCCESS":
+            print('Error in resetid functionality, restart')
+            return
+        self.DHT_setup = True
+        self.dht_status = "InDHT"
+        self.dht_id = msg_recv["id"]
+        self.DHT_year = msg_recv["year"]
+        self.DHT_size = msg_recv["hash_size"]
+        self.DHT_memberlist = msg_recv["memberlist"]
+        self.DHT_num_members = len(self.DHT_memberlist)
+        if not self.initiate_teardown(self.DHT_num_members-2, op="join"):
+            print('No response returned by teardown, unsure whether operation was completed')
+            return
+        self.initiate_rebuild()
+
 #Issue resestid
-        msg_to_send = {"format":"request", "command":"reset-id", "seq":self.p_seq, "id":0, "op":"join", "S_state": (self.name, self.ipv4, self.pport), "d":self.DHT_rn_addr} #Saadr: sending peer's address
+    def initiate_resetid(self, op): #main thread helper
+        msg_to_send = {"format":"request", "command":"reset-id", "seq":self.p_seq, "id":0, "op":"", "S_state": (self.name, self.ipv4, self.pport), "d":self.DHT_rn_addr}
+        if op=="join":
+            msg_to_send.update(op="join")
+        elif op=="leave":
+            msg_to_send.update(op="leave")
+        else:
+            print('Unknown op')
+            return
         self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
         self.p_seq = self.p_seq + 1
-        print(f'resetid request sent by joiner {self.name} to peer {self.DHT_rn_name}')
-        requests, responses = self.check_response_peer("resetid", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        print(f'resetid request sent by {op}er {self.name} to peer {self.DHT_rn_name}')
+        requests, responses = self.check_response_peer("reset-id", [(msg_to_send, self.DHT_rn_addr)], 5, 0, ret_res=True)
         if requests or not responses:
             print('No resetid response not receive check pport connections and try again')
             return
         if len(responses) > 1:
             print('Error in check_p_handler functionality, more than one response recevied')
         response = responses[0]
-        if not response[0]["status_code"] == "SUCCESS":
-            print('Error in resetid functionality, restart')
-            return
-        self.DHT_setup = True
-        self.dht_status = "InDHT"
-        msg_recv = response[0]
-        self.dht_id = msg_recv["id"]
-        self.DHT_year = msg_recv["year"]
-        self.DHT_size = msg_recv["hash_size"]
-        self.DHT_memberlist = msg_recv["memberlist"]
-        self.DHT_num_members = len(self.DHT_memberlist)
+        return response[0]
+
 
 #Issue teardown 
-        msg_to_send = {"format":"request", "command":"teardown", "seq":self.p_seq, "stop":self.DHT_num_members-2, 'Saddr':(self.ipv4, self.pport), "d":self.DHT_rn_addr} 
+    def initiate_teardown(self, stop, op): #main thread helper
+        msg_to_send = {"format":"request", "command":"teardown", "seq":self.p_seq, "stop":stop, "op":op, 'Saddr':(self.ipv4, self.pport), "d":self.DHT_rn_addr} 
         self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
         self.p_seq = self.p_seq + 1
-        print(f'teardown request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+        print(f'teardown request sent by {self.name} to peer {self.DHT_rn_name}')
         requests, responses = self.check_response_peer("teardown", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
         if requests or not responses:
             print('No teardown response received, check pport connections and try again')
             return
         if len(responses) > 1:
             print('Error in check_p_handler functionality, more than one response recevied')
+        response = responses[0]
+        return response[0]
 
 #Issue rebuild-dht
+    def initiate_rebuild(self): #main thread helper
         msg_to_send = {"format":"request", "command":"rebuild-dht", "seq":self.p_seq, "d":self.DHT_rn_addr} 
         self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
         self.p_seq = self.p_seq + 1
-        print(f'rebuild-dht request sent by joiner {self.name} to peer {self.DHT_rn_name}')
-
-        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        print(f'rebuild-dht request sent by {self.name} to peer {self.DHT_rn_name}')
+        n = self.DHT_num_members
+        stime = 1*n*(n+1)/2
+        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], stime+5, 0, ret_res=True)
         if requests or not responses:
-            print('No teardown response received, check pport connections and try again')
+            print('No rebuild response received, check pport connections and try again')
             return
         if len(responses) > 1:
             print('Error in check_p_handler functionality, more than one response recevied')
@@ -656,7 +681,16 @@ class Peer:
         if not status_code == "SUCCESS":
             print('Rebuild of dht unsuccessful, quitting')
             return
-        self.dhtrebuilt()
+        self.mport_msg_sent = {"command": "dht-rebuilt", "peername": self.name, "leadername": self.DHT_rn_name, "seq":self.m_seq}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
+        self.m_seq = self.m_seq + 1
+        self.recv_from_manager()            
+        status_com = self.mport_communication_status
+        if status_com != "DONE": #TO DO: later handle case for packet corruption
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to dht-rebuilt command')
 
     def leavedht(self, CLI_list): #running on main thread
         if not len(CLI_list) == 2:
@@ -681,75 +715,26 @@ class Peer:
             print('Failed to leave DHT, quitting')
             return
 
-#Issue resestid
-        msg_to_send = {"format":"request", "command":"reset-id", "seq":self.p_seq, "id":0, "op":"leave", "S_state": (self.name, self.ipv4, self.pport), "d":self.DHT_rn_addr} #Saadr: sending peer's address
-        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
-        self.p_seq = self.p_seq + 1
-        print(f'resetid request sent by joiner {self.name} to peer {self.DHT_rn_name}')
-        requests, responses = self.check_response_peer("resetid", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
-        if requests or not responses:
-            print('No resetid response not receive check pport connections and try again')
-            return
-        if len(responses) > 1:
-            print('Error in check_p_handler functionality, more than one response recevied')
-        response = responses[0]
-        if not response[0]["status_code"] == "SUCCESS":
+        msg_recv = self.initiate_resetid(op="leave")
+        if not msg_recv or not msg_recv["status_code"] == "SUCCESS":
             print('Error in resetid functionality, restart')
             return
         self.dht_status = "Free"
         self.dht_id = -1
-
-#Issue teardown 
-        msg_to_send = {"format":"request", "command":"teardown", "seq":self.p_seq, "stop":self.DHT_num_members-2, 'Saddr':(self.ipv4, self.pport), "d":self.DHT_rn_addr} 
-        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
-        self.p_seq = self.p_seq + 1
-        print(f'teardown request sent by joiner {self.name} to peer {self.DHT_rn_name}')
-        requests, responses = self.check_response_peer("teardown", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
-        if requests or not responses:
-            print('No teardown response received, check pport connections and try again')
+        if not self.initiate_teardown(self.DHT_num_members-2, op="leave"):
+            print('No response returned by teardown, unsure whether operation was completed')
             return
-        if len(responses) > 1:
-            print('Error in check_p_handler functionality, more than one response recevied')
-
 #Reset state of leaving peer, leaving it with knowledge of only rn_addr, rn_name, manager
         self.localDHT.clear()
+        self.DHT_num_members = self.DHT_num_members - 1
+        self.initiate_rebuild()
         self.DHT_setup = None #Only members know about DHT state
         self.DHT_memberlist = None
         self.DHT_size = None
         self.DHT_year = None
         self.DHT_num_members = None 
-#Issue rebuild-dht
-
-        msg_to_send = {"format":"request", "command":"rebuild-dht", "seq":self.p_seq, "d":self.DHT_rn_addr} 
-        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
-        self.p_seq = self.p_seq + 1
-        print(f'rebuild-dht request sent by leaver {self.name} to peer {self.DHT_rn_name}')
-
-        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
-        if requests or not responses:
-            print('No teardown response received, check pport connections and try again')
-            return
-        if len(responses) > 1:
-            print('Error in check_p_handler functionality, more than one response recevied')
-        status_code = responses[0][0]["status_code"]
-        if not status_code == "SUCCESS":
-            print('Rebuild of dht unsuccessful, quitting')
-            return
-        self.dhtrebuilt()
-
-                
-    def dhtrebuilt(self):
-        self.mport_msg_sent = {"command": "dht-rebuilt", "peername": self.name, "leadername": self.DHT_rn_name, "seq":self.m_seq}
-        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
-        self.m_seq = self.m_seq + 1
-        self.recv_from_manager()            
-        status_com = self.mport_communication_status
-        if status_com != "DONE": #TO DO: later handle case for packet corruption
-            print('Error in communication with manager, quitting')
-            return
-        status_code = self.mport_msg_received["status_code"]
-        print(f'Status code of {status_code} received from the manager in response to dht-rebuilt command')
-        
+        self.DHT_rn_addr = None   #right neighbour addr
+        self.DHT_rn_name = None
 
     def resetid(self, request): #running on p-thread
         #needs an id to specify which id to set self.dht_id to
@@ -768,6 +753,8 @@ class Peer:
 
         #reorder member list
         leader_id = self.dht_id - id
+        if self.dht_id == 0:
+            self.dht_status = 'InDHT'
         if leader_id < 0:
             leader_id = n + leader_id
         
@@ -787,8 +774,6 @@ class Peer:
                 self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
                 print(f'resetid completed at id {self.dht_id}, sending success msg {msg_to_send} to joiner {self.DHT_rn_name} at address {self.DHT_rn_addr}')
                 return
-            if id == 0:
-                self.dht_status = "Leader"
         if op == "leave":
             leaving_peer_state = self.DHT_memberlist.pop() #left neighbour becomes last element 
             self.DHT_num_members = self.DHT_num_members - 1
@@ -802,6 +787,9 @@ class Peer:
                 self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), leaving_peer_addr)
                 print(f'resetid completed at id {self.dht_id}, sending success msg to leaver {leaving_peer_state[0]} at address {leaving_peer_addr}')
                 return
+            
+        if id == 0:
+            self.dht_status = "Leader"
         id = id + 1
         msg_recv.update(id=id)
         msg_recv.update(d=self.DHT_rn_addr)
@@ -813,16 +801,31 @@ class Peer:
         self.localDHT.clear()
         seq = msg_recv["seq"]
         stop = int(msg_recv["stop"])
+        op = msg_recv["op"]
         Saddr = tuple(msg_recv["Saddr"])
         if self.dht_id == stop:
             msg_to_send = {"format":"response", "status_code":"SUCCESS", "command":"teardown", "seq":seq, "d":Saddr, "s":(self.ipv4, self.pport)}
             self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), Saddr)
             print(f'teardown completed at id {self.dht_id}, sending success msg to leaver at address {Saddr}')
-            return
+        else:
+            msg_recv.update(d=self.DHT_rn_addr)
+            self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), self.DHT_rn_addr)
+            print(f'teardown completed at id {self.dht_id}, forwarding teardown to peer {self.DHT_rn_name} at address {self.DHT_rn_addr}')
 
-        msg_recv.update(d=self.DHT_rn_addr)
-        self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), self.DHT_rn_addr)
-        print(f'teardown completed at id {self.dht_id}, forwarding teardown to peer {self.DHT_rn_name} at address {self.DHT_rn_addr}')
+        if op == "teardown":
+            self.dht_status = "Free"
+            self.dht_id = -1
+            self.DHT_setup = None #Only members know about DHT state
+            self.DHT_memberlist = None
+            self.DHT_size = None
+            self.DHT_year = None
+            self.DHT_num_members = None 
+            self.DHT_rn_addr = None   #right neighbour addr
+            self.DHT_rn_name = None
+
+    def start_rebuild_thread(self, request):
+        self.rebuild_thread = threading.Thread(target=self.rebuilddht, args=(request,), daemon=True)
+        self.rebuild_thread.start()
 
     def rebuilddht(self, request):
         msg_recv, peer_addr = request
@@ -830,7 +833,7 @@ class Peer:
         if self.dht_id != 0:
             print('I am not leader, I cannot handle this command request!')
             return
-        msg_to_send = {"format":"response", "command": "rebuild-dht", "seq":seq, "status_code":""}
+        msg_to_send = {"format":"response", "command": "rebuild-dht", "seq":seq, "status_code":"", "d":peer_addr}
         path = Path(__file__).parent / f"details-{self.DHT_year}.csv"
         df = pd.read_csv(path, dtype=str, keep_default_na=False)             
         self.DHT_size = self.calc_s(len(df))
@@ -838,12 +841,84 @@ class Peer:
         if NACK_peers:
             print('All peer ACKs not received, so DHT not fully REBUILT')
             msg_to_send.update(status_code="FAILURE")
-            self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), peer_addr)
+            self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), peer_addr)
         else:
             print('Signalling sender of completion')
             msg_to_send.update(status_code="SUCCESS")
-            self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), peer_addr)
+            self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), peer_addr)
+
+    def teardowndht(self, CLI_list): #main thread
+        if not len(CLI_list) == 2:
+            print('teardown-dht needs 1 command line parameters')
+            return
+        name = CLI_list[1]
+        if not name == self.name:
+            print(f'My name is {self.name} in the manager register!')
+            return
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "teardown-dht", "peername":self.name}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
+        self.m_seq = self.m_seq + 1
         
+        self.recv_from_manager()        
+        status_com = self.mport_communication_status
+        if status_com != "DONE":
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to teardown-dht command')
+        if status_code != "SUCCESS": 
+            print('Failed to teardown DHT, quitting')
+            return
+        if not self.initiate_teardown(self.DHT_num_members-1, op="teardown"):
+            print('No response returned by teardown, unsure whether operation was completed')
+            return
+        self.localDHT.clear()
+        self.dht_status = "Free"
+        self.dht_id = -1
+        self.DHT_setup = None #Only members know about DHT state
+        self.DHT_memberlist = None
+        self.DHT_size = None
+        self.DHT_year = None
+        self.DHT_num_members = None 
+        self.DHT_rn_addr = None   #right neighbour addr
+        self.DHT_rn_name = None
+
+        self.mport_msg_sent = {"command": "teardown-complete", "peername": self.name, "seq":self.m_seq}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
+        self.m_seq = self.m_seq + 1
+        self.recv_from_manager()            
+        status_com = self.mport_communication_status
+        if status_com != "DONE": #TO DO: later handle case for packet corruption
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to teardown-complete command')
+
+    def deregister(self, CLI_list): #on main thread
+        if not len(CLI_list) == 2:
+            print('teardown-dht needs 1 command line parameters')
+            return
+        name = CLI_list[1]
+        if not name == self.name:
+            print(f'My name is {self.name} in the manager register!')
+            return
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "deregister", "peername":self.name}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
+        self.m_seq = self.m_seq + 1
+        
+        self.recv_from_manager()        
+        status_com = self.mport_communication_status
+        if status_com != "DONE":
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to deregister command')
+        if status_code != "SUCCESS":
+            print('Failed to deregister, staying')
+        else:
+            print('deregistration successful, shutting down process')
+            sys.exit(0)
+       
     def read_CLI(self):
         print("Peer process started. Please enter the message to be sent to the manager")
         while True:
@@ -876,5 +951,6 @@ def main(): #module level function (outside Peer class)
 
 if __name__ == "__main__":
     main()
+
 
             
