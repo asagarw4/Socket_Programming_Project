@@ -100,20 +100,19 @@ class Peer:
         if not len(CLI_list) == 5:
             print('register needs four command line parameters')
             return
-        self.name = CLI_list[1]
-        self.ipv4 = CLI_list[2]
-        self.mport = int(CLI_list[3])
-        self.pport =int(CLI_list[4])
+        name = CLI_list[1]
+        ipv4 = CLI_list[2]
+        mport = int(CLI_list[3])
+        pport =int(CLI_list[4])
 
-        self.mport_msg_sent = {"seq":self.m_seq, "command": "register", "peername":self.name, "ipv4":self.ipv4, "mport":self.mport, "pport":self.pport}
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "register", "peername":name, "ipv4":ipv4, "mport":mport, "pport":pport}
         self.m_seq = self.m_seq + 1
 
-
-        if not self.registration_attempted:
-            self.m_socket.bind(("", self.mport)) #Don't test register retrying
+        if not self.registration_attempted: #If register retrying occurs, peer will still send to manager from the original mport
+            self.m_socket.bind(("", mport)) 
             self.registration_attempted = True
         else:
-            print('registration already attempted, stick to mport to retry!') #keeping mport same, not rebinding
+            print('registration already attempted, sticking to the original mport to send the message to manager!') #keeping mport same, not rebinding
 
         self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
 
@@ -127,7 +126,11 @@ class Peer:
             return
         if status_com == "DONE":
             status_code = self.mport_msg_received["status_code"]
-            if status_code == "SUCCESS": 
+            if status_code == "SUCCESS":  #aligning state accordingly
+                self.name = name
+                self.ipv4 = ipv4
+                self.mport = mport
+                self.pport = pport
                 self.dht_status = "Free"
                 self.p_socket.bind((self.ipv4, self.pport))
                 self.pport_thread = threading.Thread(target=self.listen_pport, daemon=True) #general peer starts listening at pport
@@ -281,9 +284,9 @@ class Peer:
                 if (p // msgs_per_slot) % batch_size == 0:
                     time.sleep(0.001) #to avoid bursts of packets
             
-            sleep_time = 1.5*(n-i) #wait more for 1, as ACK will be sent through right neghbours
+            sleep_time = 2*(n-i) #wait more for 1, as ACK will be sent through right neghbours
             trials = 5
-            time.sleep(2)
+            time.sleep(4)
             print(f'PEER {i} RECORDS----------------------')
             requests, responses = self.check_response_peer("store", requests, sleep_time, trials) #Needs ACK for each individual store msg, resends the unacked msg after timeout
             if requests:
@@ -392,7 +395,7 @@ class Peer:
                 self.p_socket.sendto((json.dumps(msg_recv)).encode('utf-8'), self.DHT_rn_addr)
                     
             else:
-                if len(self.pport_recv_response) > 1500:
+                if len(self.pport_recv_response) > 5000:
                     del self.pport_recv_response[0]
                 self.pport_recv_response.append(response)
             return                    
@@ -675,7 +678,7 @@ class Peer:
         self.p_seq = self.p_seq + 1
         print(f'rebuild-dht request sent by {self.name} to peer {self.DHT_rn_name}')
         n = self.DHT_num_members
-        stime = 1*n*(n+1)/2
+        stime = n*(n+1)
         requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], stime+5, 0, ret_res=True)
         if requests or not responses:
             print('No rebuild response received, check pport connections and try again')
