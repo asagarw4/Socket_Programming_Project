@@ -208,7 +208,11 @@ class Peer:
                 self.DHT_rn_addr = (rn_tuple[1], int(rn_tuple[2]))
 
                 path = Path(__file__).parent / f"details-{self.DHT_year}.csv"
-                df = pd.read_csv(path, dtype=str, keep_default_na=False)             
+
+                try:
+                    df = pd.read_csv(path, dtype=str, keep_default_na=False)  
+                except Exception as e:
+                    print('Exception was thrown while opening file, quit and try again')    
                 self.DHT_size = self.calc_s(len(df))
 
                 self.set_peer_ids() #send memberlist, set id on each member
@@ -344,9 +348,9 @@ class Peer:
             if (trials_left < 0):
                 break
             if requests:
+                print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
                 for request in requests: #resend the requests for which no response was received
                     self.p_socket.sendto((json.dumps(request[0])).encode('utf-8'), request[1])
-                print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
 
         if requests:
             print(f'No response after waiting for {sleep_time}s, for all {trials}')
@@ -897,7 +901,7 @@ class Peer:
 
     def deregister(self, CLI_list): #on main thread
         if not len(CLI_list) == 2:
-            print('deregister needs 1 command line parameters')
+            print('teardown-dht needs 1 command line parameters')
             return
         name = CLI_list[1]
         if not name == self.name:
@@ -953,5 +957,8 @@ def main(): #module level function (outside Peer class)
 if __name__ == "__main__":
     main()
 
+
+
+            
 
             
