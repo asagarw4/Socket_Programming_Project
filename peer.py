@@ -6,23 +6,26 @@ import random
 import time
 from pathlib import Path
 import pandas as pd
+import copy
 
 class Peer:
     def __init__(self, manager_addr):
         self.manager_addr = manager_addr
         self.m_socket = socket(AF_INET, SOCK_DGRAM)
         self.p_socket = socket(AF_INET, SOCK_DGRAM)
-        self.m_handlers = {"register": self.register, "setup-dht": self.setup_dht, "dht-complete": self.dht_complete}
-        self.p_handlers = {"setid": self.setid}
+        self.m_handlers = {"register": self.register, "setup-dht": self.setupdht, "query-dht": self.querydht, "join-dht": self.joindht, "leave-dht": self.leavedht}
+        self.p_handlers = {"setid": self.setid, "store": self.store, "find-event":self.find_event, "reset-id":self.resetid, "teardown":self.teardown, "rebuild-dht":self.rebuilddht()}
         self.m_seq = random.randrange(2**15)
         self.p_seq = random.randrange(2**15)
         
         #personal info
+        self.registration_attempted = False
+        self.name = None
         self.ipv4 = None
         self.mport = None
         self.pport = None
         self.dht_id = -1   #-1 if and only if not DHT_member
-        self.dht_status = None #Free, Leader, Member, Joining, Leaving
+        self.dht_status = None #Free, Leader, InDHT, Joining, Leaving
 
         #DHT meta related info
         self.DHT_setup = False
@@ -33,13 +36,12 @@ class Peer:
         #DHT managment info
         self.DHT_rn_addr = None   #right neighbour addr
         self.DHT_rn_name = None
-        self.DHT_size = None
-        self.DHT_s = None #smallest prime greater than 2 * l
+        self.DHT_size = None #smallest prime greater than 2 * l
         self.localDHT = {}  #stores a local DHT as a dict, keyed by postion
 
         #mport-thread info
         self.mport_thread = None
-        self.mport_timeout = 100 #default setting, changed according to task before sendto
+        self.mport_timeout = 10 #default setting, changed according to task before sendto
         self.mport_trials = 5 #default setting, changed according to task beofre sendto
         self.mport_msg_sent = None
         self.mport_msg_received = None
@@ -50,20 +52,20 @@ class Peer:
         self.pport_thread = None
         self.pport_recv_response = []
         self.pport_requests= {}
-        self.pport_timeout = 100 #default setting, changed according to task before sendto (managed inside check_ACK)
+        self.pport_timeout = 7 #default setting, changed according to task before sendto (managed inside check_ACK)
         self.pport_trials = 5 #default setting, changed according to task beofre sendto (managed inside check_ACK)
         self.pport_communication_status = None  # "ERROR", "TIMEOUT", "DONE"
 
     def recv_from_manager(self):  #On main thread version, with max_trials to prevent program hanging
         self.m_socket.settimeout(self.mport_timeout)
         trials_left = self.mport_trials
-
+        self.mport_communication_status = None
         while trials_left > 0:
             try: #Try and see if anything received
                 msg_recv, manager_addr = self.m_socket.recvfrom(1000)
-            except TimeoutError: #Timed out, resend and continue to try receive
+            except timeout: #Timed out, resend and continue to try receive
                 self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)          
-                tries_left = tries_left - 1
+                trials_left = trials_left - 1
                 continue
 
             if (manager_addr != self.manager_addr): #check if msg was sent by manager
@@ -78,9 +80,9 @@ class Peer:
                 return
 
             #JSON convertible, check if same seq
-            if msg_recv[self.m_seq] < self.mport_msg_sent["seq"]:
+            if msg_recv["seq"] < self.mport_msg_sent["seq"]:
                 continue #Older msg status code received, ignore
-            if msg_recv[self.m_seq] > self.mport_msg_sent["seq"]:
+            if msg_recv["seq"] > self.mport_msg_sent["seq"]:
                 print(f'Return message from manager missed, latest message: {msg_recv}')
                 return
             #seq check passed, correct msg received, wrap up
@@ -105,6 +107,14 @@ class Peer:
 
         self.mport_msg_sent = {"seq":self.m_seq, "command": "register", "peername":self.name, "ipv4":self.ipv4, "mport":self.mport, "pport":self.pport}
         self.m_seq = self.m_seq + 1
+
+
+        if not self.registration_attempted:
+            self.m_socket.bind(("", self.mport)) #Don't test register retrying
+            self.registration_attempted = True
+        else:
+            print('registration already attempted, stick to mport to retry!') #keeping mport same, not rebinding
+
         self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
 
         self.recv_from_manager()        
@@ -119,6 +129,7 @@ class Peer:
             status_code = self.mport_msg_received["status_code"]
             if status_code == "SUCCESS": 
                 self.dht_status = "Free"
+                self.p_socket.bind((self.ipv4, self.pport))
                 self.pport_thread = threading.Thread(target=self.listen_pport, daemon=True) #general peer starts listening at pport
                 self.pport_thread.start()
             print(f'Status code of {status_code} received from the manager in response to register command')
@@ -132,9 +143,15 @@ class Peer:
             print('setup-dht needs three command line parameters')
             return
         peer_name = CLI_list[1]
-        self.DHT_num_members = CLI_list[2]
-        self.DHT_year = int(CLI_list[3])
+        try:
+            n = int(CLI_list[2])
+            year = int( CLI_list[3])
+        except ValueError:
+            print('n and year must be integer values! Wrong usage, try again')
+            return
 
+        self.DHT_num_members = n
+        self.DHT_year = year
         if not peer_name == self.name: #Refuse to make an irrelevant request, confusing state
             print(f'My name is {self.name} in the manager register!')
             return
@@ -148,11 +165,11 @@ class Peer:
             print("Uptil 250 members are allowed, but restrict till 20 for prototype")
             return
         
-        self.mport_msg_sent = {"seq":self.m_seq, "command": "setupdht", "peername": self.name, "n": self.DHT_num_members, "year": self.DHT_year}
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "setup-dht", "peername": self.name, "n": self.DHT_num_members, "year": self.DHT_year}
         self.m_seq = self.m_seq + 1
         self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
         
-        self.mport_timeout = 100
+        self.mport_timeout = 5
         self.mport_trials = 5
         self.recv_from_manager()        
         status_com = self.mport_communication_status
@@ -161,15 +178,14 @@ class Peer:
             print('Errorsome message received from manager, check syntax before resending')
             return
         if status_com == "TIMEOUT":
-            print(f'Manager not responding after  and {self.pport_timeout} timeout and {self.pport_trials} max_trials, so stopped listening')
+            print(f'Manager not responding after {self.mport_timeout} timeout and {self.mport_trials} max_trials, so stopped listening')
             return
         if status_com == "DONE": 
             status_code = self.mport_msg_received["status_code"]
-            print(f'Status code of {status_code} received from the manager in response to register command')
+            print(f'Status code of {status_code} received from the manager in response to setup-dht command')
             if not status_code == "SUCCESS":
                 return
             else:
-                self.dht_status = "Leader"
                 memberlist = self.mport_msg_received["memberlist"] 
                 if not memberlist: #Check existence of member list
                     print('Member list missing from setupdht response')
@@ -184,80 +200,158 @@ class Peer:
                 if not self.DHT_memberlist[0] == (self.name, self.ipv4, self.pport): #check if leader tuple is correctly set
                     print(f"Member list first tuple incorrect: {self.DHT_memberlist[0]}")
                     return
+                
+                self.dht_status = "Leader"
                 self.dht_id = 0
-                self.set_peer_ids()
-                self.DHT_data(self.DHT_num_members, self.DHT_year)
-            return
-        print('Unknown status communication code')
-        return
+                rn_tuple = self.DHT_memberlist[1]
+                self.DHT_rn_name = rn_tuple[0]
+                self.DHT_rn_addr = (rn_tuple[1], int(rn_tuple[2]))
 
-    def is_prime(self, n):
-        if n < 2:
-            return False
-        i = 2
-        while i * i <= n:
-            if n % i == 0:
-                return False
-        i += 1
-        return True
-    
-    def next_prime_after(self, x):
-        n = x + 1
-        while not self.is_prime(n):
-            n += 1
-        return n
+                path = Path(__file__).parent / f"details-{self.DHT_year}.csv"
+                df = pd.read_csv(path, dtype=str, keep_default_na=False)             
+                self.DHT_size = self.calc_s(len(df))
 
-    def DHT_data(self, n, year):
-        path = Path.home() / "Downloads" / "details-1996.csv"
-        df = pd.read_csv(path)
-        records = df.values.tolist()
+                self.set_peer_ids() #send memberlist, set id on each member
 
-        l = len(df)
-        s = self.next_prime_after(2*l)
-        for event_id in df["event_id"].values:
-            pos = int(event_id) % s
+                NACK_peers = self.DHT_data(df) #load and distribute dataset using store command
+                if NACK_peers:
+                    print('All peer ACKs not received, but for testing going ahead with dht-complete')
+                self.dhtcomplete()
+
+    def calc_s(self, l):
+        s = 2*l
+        is_prime = False
+        while not is_prime:
+            i = 2
+            s = s+1 #incrementally check for factors, starting 2l+1
+            is_prime = True
+            while i*i <= s:
+                if s%i == 0:
+                    is_prime = False
+                    break
+                i = i+1
+        return s
+
+    def DHT_data(self, df):
+        s = self.DHT_size
+        n = self.DHT_num_members
+        global_DHT = {i: {} for i in range(n)}
+
+        #storing all entries from df in global_DHT, keyed by id, and then by pos
+        for row in df.itertuples(index=False):
+            entry = list(row)
+            pos = int(row.EVENT_ID) % s
             peer_id = pos % n
 
+            if not global_DHT.get(peer_id):
+                global_DHT.update({peer_id: {pos: [entry]}})
+            elif not global_DHT[peer_id].get(pos):
+                global_DHT[peer_id].update({pos: [entry]})
+            else:
+                global_DHT[peer_id][pos].append(entry)
 
+        #storing the id 0 entries in the leader's local_DHT
+        self.localDHT.update(global_DHT[0])
 
+        #To avoid IP fragmentation, we set send 5 pos slots per message
+        #To avoid congesting the network, we sleep for 2 milliseconds every 5 messages
+        #and for 10 milliseconds after every 100 messages
+        self.pport_recv_response.clear() #clear responses to make room for ACKs (~1350) from peer
+        msgs_per_slot = 3
+        batch_size = 10
+        NACK_peers = []
+        #sending (sorted by id) list of pos
+        for i in range(1, n):
+            pos_list = list(global_DHT[i].items()) #storing (pos, entry) tuples in a list
+            p = 0
+            requests = []
+            while p < len(pos_list):
+                v = self.DHT_memberlist[i]
+                msg_sent = {"format":"request", "command": "store", "id":i, "seq": self.p_seq, "data":[]}
+                msg_sent.update(data = pos_list[p:p+msgs_per_slot]) #data = [(pos1, entry1), (pos2, entry2)]
+                requests.append((msg_sent, self.DHT_rn_addr))
+                self.p_socket.sendto((json.dumps(msg_sent)).encode('utf-8'), self.DHT_rn_addr)
+                self.p_seq = self.p_seq+1
+                p = p+msgs_per_slot
+                
+                if (p // msgs_per_slot) % batch_size == 0:
+                    time.sleep(0.005) #to avoid bursts of packets
+            sleep_time = 1*(n-i) #wait more for 1, as ACK will be sent through right neghbours
+            trials = 3
+            requests, responses = self.check_response_peer("store", requests, sleep_time, trials) #Needs ACK for each individual store msg, resends the unacked msg after timeout
+            if requests:
+                print(f'The following {requests} were not received by peer {i}, after {sleep_time} timeouts on each of {trials} trials')
+                NACK_peers.append(i)
+            self.pport_recv_response.clear() #clear responses to make room for ACKs (~1350) from peer
+        return NACK_peers
+
+    def store(self, request):
+         #request arrived at target node/peer id
+        data = request[0]["data"]
+        for pos, entries in data: #Note: lack of error checking done here
+            pos = int(pos) #ensuring that pos is int, so can be directly used as key during query
+            self.localDHT.update({pos: entries}) #Example {pos: [['5553873', 'KENTUCKY', '1996', 'May', 'Tornado', 'C', 'JEFFERSON', '0', '0', '0', '0', '', '0', 'F1']]}
+                #pos is a key to a list of (clashing) entries, and each entry is itself a list
+        response_msg = {"format":"response", "command": "store", "seq":request[0]["seq"], "id":self.dht_id} #new command for p2p, denotes ACK
+        self.p_socket.sendto((json.dumps(response_msg)).encode('utf-8'), self.DHT_rn_addr)
+
+    def dhtcomplete(self):
+        self.mport_msg_sent = {"command": "dht-complete", "peername": self.name, "seq":self.m_seq}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
+        self.m_seq = self.m_seq + 1
+        self.recv_from_manager()            
+        status_com = self.mport_communication_status
+        if status_com == "ERROR": #TO DO: later handle case for packet corruption
+            print('Errorsome message received from manager, check syntax before resending')
+        elif  status_com == "TIMEOUT":
+            print(f'Manager not responding after  and {self.mport_timeout} timeout and {self.mport_trials} max_trials, so stopped listening')
+            return
+        elif status_com == "DONE":
+            status_code = self.mport_msg_received["status_code"]
+            if status_code == "SUCCESS": 
+                self.DHT_setup = True
+            print(f'Status code of {status_code} received from the manager in response to dht-complete command')
+        else:        
+            print('Unknown status communication code')
+        return
         
-        
-
-
-
-
-
-
-
-        
-        
-
-    def check_response_peer(self, requests, sleep_time, trials): #Note, requests is a list of request, so if a single msg sent, pass: [(msg_sent, peer_addr)]
+    #return a list of impending requests, and if ret_res is True, returns respones to requests that were satisfied 
+    def check_response_peer(self, command, requests, sleep_time, trials, ret_res=False): #Note, requests is a list of request, so if a single msg sent, pass: [(msg_sent, peer_addr)]
         trials_left = trials
-        while trials_left > 0 and requests:
+        responses = []
+        while trials_left >= 0 and requests:
             time.sleep(sleep_time)
-            for response in self.pport_recv_response:
+            for response in self.pport_recv_response.copy():
                 res_seq = response[0]["seq"] 
-                res_addr = response[1]
+                if response[0]["command"] != command:
+                    continue
+
                 for request in requests:
                     req_seq = request[0]["seq"]
-                    req_addr = request[1]
-                
-                    if (req_seq, req_addr) == (res_seq, res_addr): #peer_addr just as an additional check
-                        print(f"response {response} received")
+
+                    if req_seq == res_seq:
                         self.pport_recv_response.remove(response) #Ideally, should delete all duplicate req, but costlier
                         requests.remove(request)
-
+                        if ret_res == True:
+                            print(f"response {response} to store command received")
+                            responses.append(response)
+                        break #response matched with a request, move onto next response
+                            
             trials_left = trials_left - 1
-            print(f'No response after waiting for {sleep_time}s, resending request, trial {trials - trials_left}')
-            for request in requests: #resend the responses for which no ACK was received
-                self.p_socket.sendto((json.dumps(request[0])).encode('utf-8'), request[1])
-        return requests #Return the list of requests whose ACKs were not received
+            if requests:
+                for request in requests: #resend the requests for which no response was received
+                    print(f'No response after waiting for {sleep_time}s, resending request after trial {trials - trials_left}')
+                    self.p_socket.sendto((json.dumps(request[0])).encode('utf-8'), request[1])
+
+        if requests:
+            print(f'No response after waiting for {sleep_time}s, for all {trials}')
+        else:
+            print(f'All responses to requests for command {command} received')
+        return requests, responses #Return the list of requests whose ACKs were not received
 
     def listen_pport(self): #called only after register command handled successfully
-        self.p_socket.bind(self.ipv4, self.pport)
         while True:
-            msg_recv, peer_addr = self.p_socket.recvfrom(1000)
+            msg_recv, peer_addr = self.p_socket.recvfrom(65535)
             try:  #Something recevied, check if json convertible
                 msg_recv = json.loads((msg_recv).decode('utf-8'))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -265,37 +359,64 @@ class Peer:
                 self.pport_communication_status = "ERROR"
                 continue
 
-            format = msg_recv['format']
-            if (format == 'ACK' or format == 'response'):
-                response = (msg_recv, peer_addr)
-                if len(self.pport_recv_response) > 20:
+            try: #for debudding, as p-thread is separate from main-thread
+                self.handle_pport_msg((msg_recv, peer_addr))
+            except Exception as e:
+                print(f'Exception {e} was thrown while handling message {msg_recv} from {peer_addr}')
+
+    def handle_pport_msg(self, req_or_resp):
+        (msg_recv, peer_addr) = req_or_resp
+        
+        format = msg_recv.get('format')
+        command = msg_recv['command']
+
+        if not command or not format:
+            print('Command field or Format field missing from request recevied at pport')
+            return
+
+        if format == 'response':
+            response = (msg_recv, peer_addr)
+            if command=="store" and self.dht_id != 0:
+                self.p_socket.sendto((json.dumps(msg_recv)).encode('utf-8'), self.DHT_rn_addr)
+    
+            elif command!="store" and [self.ipv4, self.pport] != msg_recv["d"]:
+                self.p_socket.sendto((json.dumps(msg_recv)).encode('utf-8'), self.DHT_rn_addr)
+                    
+            else:
+                if len(self.pport_recv_response) > 1500:
                     del self.pport_recv_response[0]
                 self.pport_recv_response.append(response)
-                continue
-            if not format=='request':
-                print('Unknown format msg received at pport')
-                continue
+            return                    
+        
+        if not format=='request':
+            print('Unknown format msg received at pport')
+            return
 
-            request = (msg_recv, peer_addr)
-            if request in self.pport_requests:
-                print('Duplicate request found, resending response')
-                self.p_socket.sendto((json.dumps(self.pport_requests.get(request))).encode('utf-8'), peer_addr)
-                continue
+        request = (msg_recv, peer_addr)
+        request_hash = (msg_recv['seq'], peer_addr)
 
-            command = msg_recv['command']
-            if not command:
-                print('Command field missing from request recevied at pport')
-                continue
+        if command == 'store' and self.dht_id != msg_recv['id']:
+            self.p_socket.sendto((json.dumps(msg_recv)).encode('utf-8'), self.DHT_rn_addr)
+            return
+        if command != 'store' and [self.ipv4, self.pport] != msg_recv['d']:
+            self.p_socket.sendto((json.dumps(msg_recv)).encode('utf-8'), self.DHT_rn_addr)
+            return
 
-            handler = self.p_handlers[command]
-            if not handler:
-                print('INVALID command field found in request recevied at pport')
-                continue
+        if request_hash in self.pport_requests:
+            print('Duplicate request found, resending response')
+            self.p_socket.sendto((json.dumps(self.pport_requests[request_hash])).encode('utf-8'), peer_addr)
+            return
 
-            response = handler(request) #response should be in json
-            if len(self.pport_requests) > 20:
-                self.pport_requests.popitem()
-            self.pport_requests.update(request=response)
+        handler = self.p_handlers.get(command)
+        if not handler:
+            print('INVALID command field found in request recevied at pport')
+            return
+
+        response = handler(request) #response should be in json, and just the msg
+        if len(self.pport_requests) > 20:
+            del self.pport_requests[next(iter(self.pport_requests))] #delete oldest request
+        if response:
+            self.pport_requests.update({request_hash: response})
 
     def set_peer_ids(self): #called by setupdht, main-thread
         requests = []
@@ -307,12 +428,12 @@ class Peer:
             peer_addr = (v[1], v[2])
             
             p_seq = self.p_seq
-            msg_to_send = {"format": "request", "command": "setid", "id":peer_id, "name":peer_name, "seq":p_seq, "memberlist":self.DHT_memberlist} #peer name passed as additional check
+            msg_to_send = {"format": "request", "command": "setid", "id":peer_id, "name":peer_name, "seq":p_seq, "d":peer_addr, "memberlist":self.DHT_memberlist, "hash_size":self.DHT_size, "year":self.DHT_year} #peer name passed as additional check
             requests.append((msg_to_send, peer_addr))
             self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), peer_addr)
             self.p_seq = self.p_seq + 1
 
-        requests_missingACK = self.check_response_peer(requests, 50, 3)
+        requests_missingACK, responses = self.check_response_peer("setid", requests, 2, 3)
         for request in requests_missingACK:
             print(f'ACK for request {request} to member id {request[0]["id"]} not received, pls recheck')
         return
@@ -326,25 +447,407 @@ class Peer:
         name = msg_recv["name"]
         seq = msg_recv["seq"]
         self.DHT_memberlist = msg_recv["memberlist"]
+        self.DHT_num_members = len(self.DHT_memberlist)
+        self.DHT_size = msg_recv["hash_size"]
+        self.DHT_year = msg_recv["year"]
 
-        if not self.dht_id or not name or not seq or not self.DHT_memberlist:
+        if not self.dht_id or not name or not seq or not self.DHT_memberlist or not self.DHT_size or not self.DHT_year:
             print('missing fields found in setid request, pls check')
             return
         if not name==self.name:
             print(f'My name is {self.name}, not {name}! Incorrect setid request received')
             return
         
-        rn_v = self.DHT_memberlist[self.dht_id+1]
+        rn_v = self.DHT_memberlist[(self.dht_id+1)%self.DHT_num_members]
         self.DHT_rn_name = rn_v[0]
         self.DHT_rn_addr = (rn_v[1], rn_v[2])
-        ACK_msg = {"format":"response", "seq":seq}
+        ACK_msg = {"format":"response", "command":"setid", "seq":seq, "d":leader_addr}
         self.p_socket.sendto((json.dumps(ACK_msg)).encode('utf-8'), leader_addr)
         return
+
+    def querydht(self, CLI_list): #running on main thread
+        if not len(CLI_list) == 3:
+            print('querydht needs 2 command line parameters')
+            return
+        name = CLI_list[1]
+        if not name == self.name:
+            print(f'My name is {self.name} in the manager register!')
+            return
+        try:
+            event_id = int(CLI_list[2])
+        except ValueError:
+            print('event-id must be an integer value! Wrong usage, try again')
+            return
+        
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "query-dht", "peername":self.name, "event-id":event_id}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
+        self.m_seq = self.m_seq + 1
+
+        self.recv_from_manager()        
+        status_com = self.mport_communication_status
+        if status_com == "ERROR": #TO DO: later handle case for packet corruption
+            print('Errorsome message received from manager, check syntax before resending')
+            return
+        if  status_com == "TIMEOUT":
+            print(f'Manager not responding after  and {self.mport_timeout} timeout and {self.mport_trials} max_trials, so stopped listening')
+            return
+        if status_com == "DONE":
+            status_code = self.mport_msg_received["status_code"]
+            print(f'Status code of {status_code} received from the manager in response to query command')
+            if status_code == "SUCCESS": 
+                S_peer_tuple = self.mport_msg_received["peer"]
+                S_peer_addr = (S_peer_tuple[1], S_peer_tuple[2])
+                msg_to_send = {"format":"request", "command":"find-event", "seq":self.p_seq, "event-id":event_id, "id-seq":[], "Saddr": (self.ipv4, self.pport), "d":S_peer_addr} #Saadr: sending peer's address
+                self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), S_peer_addr)
+                self.p_seq = self.p_seq + 1
+                print(f'find-event request sent by querer {self.name} to peer {S_peer_tuple[0]}')
+                requests, responses = self.check_response_peer("find-event", [(msg_to_send, S_peer_addr)], 5, 1, ret_res=True)
+                if requests or not responses:
+                    print('No query response not receive check pport connections and try again')
+                    return
+                if len(responses) > 1:
+                    print('Error in check_p_handler functionality, more than one response recevied')
+                response = responses[0]
+                if not response[0]["status_code"] == "SUCCESS":
+                    print(f"Storm event {event_id} not found in the DHT.")
+                else:
+                    entry = response[0]['entry']
+                    cols = [
+    "EVENT_ID", "STATE", "YEAR", "MONTH_NAME", "EVENT_TYPE",
+    "CZ_TYPE", "CZ_NAME", "INJURIES_DIRECT", "INJURIES_INDIRECT",
+    "DEATHS_DIRECT", "DEATHS_INDIRECT", "DAMAGE_PROPERTY",
+    "DAMAGE_CROPS", "TOR_F_SCALE",]
+                    if len(cols) != len(entry):
+                        print("Not ALL fields in entry received")
+                    for i in range(len(cols)):
+                        print(f'{cols[i]}: {entry[i]}\n')
+
+    def find_event(self, request): #running on p-thread
+        msg_recv, peer_addr = request
+        event_id = int(msg_recv["event-id"])
+        Saddr = tuple(msg_recv["Saddr"])
+        id_seq = msg_recv["id-seq"] #list of ids of nodes visited during query
+        seq = msg_recv["seq"] #current seq-id at pport
+        target_entry = None
+        n = self.DHT_num_members
+
+        if not event_id or not Saddr or not seq:
+            print(f'fields are missing from find-event query message at peer {self.name}, with id {self.dht_id}')
+            return
+
+        if not id_seq: #If this is the starting node
+            id_seq.append(self.dht_id)
+
+        pos = event_id % self.DHT_size
+        peer_id = pos % self.DHT_num_members
+
+        if len(id_seq) > 0 or (self.dht_id == peer_id):
+            print(f'query received at random target node {self.dht_id}, checking if entry stored at calculated pos')
+            entries = self.localDHT.get(pos)
+
+            if entries:
+                for entry in entries: #check if any entries at pos correspond to the query event-id
+                    if int(entry[0]) == event_id:
+                        target_entry = entry
+                        break
+                
+            if target_entry:    
+                msg_to_send = {"format":"response", "status_code":"SUCCESS", "command":"find-event", "seq":seq, "id-seq":id_seq, "d":Saddr, "entry":target_entry} #Saadr: sending peer's address
+                self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), Saddr)
+                print(f'query entry found at id {self.dht_id}, sending success msg {msg_to_send} to querer at address {Saddr}')
+                return
+            
+        if len(id_seq) >= n:
+            print(f"Storm event {event_id} not found in the DHT.")
+            msg_to_send = {"format":"response", "status_code":"FAILURE", "command":"find-event", "seq":seq, "id-seq":id_seq, "d":Saddr}
+            self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), Saddr)
+            return
+            
+        I = set(range(n)) - set(id_seq)
+        next = random.choice(tuple(I))
+        id_seq.append(next)
+
+        next_tuple = self.DHT_memberlist[next]
+        next_name = next_tuple[0]
+        next_addr = (next_tuple[1], next_tuple[2])
+        
+        msg_to_send = copy.deepcopy(msg_recv)
+        msg_to_send.update({"id-seq":id_seq})
+        msg_to_send.update(d=next_addr)
+        print(f'Forwarding query to random node id {next} with name {next_name}')
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), next_addr)
+        return
+
+    def joindht(self, CLI_list): #running on main thread
+        if not len(CLI_list) == 2:
+            print('join-dht needs 1 command line parameters')
+            return
+        name = CLI_list[1]
+        if not name == self.name:
+            print(f'My name is {self.name} in the manager register!')
+            return
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "join-dht", "peername":self.name}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
+        self.m_seq = self.m_seq + 1
+
+        self.recv_from_manager()        
+        status_com = self.mport_communication_status
+        if status_com != "DONE":
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to join-dht command')
+        if status_code != "SUCCESS": 
+            print('Failed to join DHT, quitting')
+            return
+        rn_tuple = self.mport_msg_received["peer"]
+        self.DHT_rn_name = rn_tuple[0]
+        self.DHT_rn_addr = (rn_tuple[1], rn_tuple[2])
+
+#Issue resestid
+        msg_to_send = {"format":"request", "command":"reset-id", "seq":self.p_seq, "id":0, "op":"join", "S_state": (self.name, self.ipv4, self.pport), "d":self.DHT_rn_addr} #Saadr: sending peer's address
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'resetid request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+        requests, responses = self.check_response_peer("resetid", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No resetid response not receive check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+        response = responses[0]
+        if not response[0]["status_code"] == "SUCCESS":
+            print('Error in resetid functionality, restart')
+            return
+        self.DHT_setup = True
+        self.dht_status = "InDHT"
+        msg_recv = response[0]
+        self.dht_id = msg_recv["id"]
+        self.DHT_year = msg_recv["year"]
+        self.DHT_size = msg_recv["hash_size"]
+        self.DHT_memberlist = msg_recv["memberlist"]
+        self.DHT_num_members = len(self.DHT_memberlist)
+
+#Issue teardown 
+        msg_to_send = {"format":"request", "command":"teardown", "seq":self.p_seq, "stop":self.DHT_num_members-2, 'Saddr':(self.ipv4, self.pport), "d":self.DHT_rn_addr} 
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'teardown request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+        requests, responses = self.check_response_peer("teardown", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No teardown response received, check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+
+#Issue rebuild-dht
+        msg_to_send = {"format":"request", "command":"rebuild-dht", "seq":self.p_seq, "d":self.DHT_rn_addr} 
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'rebuild-dht request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+
+        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No teardown response received, check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+        status_code = responses[0][0]["status_code"]
+        if not status_code == "SUCCESS":
+            print('Rebuild of dht unsuccessful, quitting')
+            return
+        self.dhtrebuilt()
+
+    def leavedht(self, CLI_list): #running on main thread
+        if not len(CLI_list) == 2:
+            print('join-dht needs 1 command line parameters')
+            return
+        name = CLI_list[1]
+        if not name == self.name:
+            print(f'My name is {self.name} in the manager register!')
+            return
+        self.mport_msg_sent = {"seq":self.m_seq, "command": "leave-dht", "peername":self.name}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'), self.manager_addr)
+        self.m_seq = self.m_seq + 1
+
+        self.recv_from_manager()        
+        status_com = self.mport_communication_status
+        if status_com != "DONE":
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to leave-dht command')
+        if status_code != "SUCCESS": 
+            print('Failed to leave DHT, quitting')
+            return
+
+#Issue resestid
+        msg_to_send = {"format":"request", "command":"reset-id", "seq":self.p_seq, "id":0, "op":"leave", "S_state": (self.name, self.ipv4, self.pport), "d":self.DHT_rn_addr} #Saadr: sending peer's address
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'resetid request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+        requests, responses = self.check_response_peer("resetid", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No resetid response not receive check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+        response = responses[0]
+        if not response[0]["status_code"] == "SUCCESS":
+            print('Error in resetid functionality, restart')
+            return
+        self.dht_status = "Free"
+        self.dht_id = -1
+
+#Issue teardown 
+        msg_to_send = {"format":"request", "command":"teardown", "seq":self.p_seq, "stop":self.DHT_num_members-2, 'Saddr':(self.ipv4, self.pport), "d":self.DHT_rn_addr} 
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'teardown request sent by joiner {self.name} to peer {self.DHT_rn_name}')
+        requests, responses = self.check_response_peer("teardown", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No teardown response received, check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+
+#Reset state of leaving peer, leaving it with knowledge of only rn_addr, rn_name, manager
+        self.localDHT.clear()
+        self.DHT_setup = None #Only members know about DHT state
+        self.DHT_memberlist = None
+        self.DHT_size = None
+        self.DHT_year = None
+        self.DHT_num_members = None 
+#Issue rebuild-dht
+
+        msg_to_send = {"format":"request", "command":"rebuild-dht", "seq":self.p_seq, "d":self.DHT_rn_addr} 
+        self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+        self.p_seq = self.p_seq + 1
+        print(f'rebuild-dht request sent by leaver {self.name} to peer {self.DHT_rn_name}')
+
+        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], 5, 1, ret_res=True)
+        if requests or not responses:
+            print('No teardown response received, check pport connections and try again')
+            return
+        if len(responses) > 1:
+            print('Error in check_p_handler functionality, more than one response recevied')
+        status_code = responses[0][0]["status_code"]
+        if not status_code == "SUCCESS":
+            print('Rebuild of dht unsuccessful, quitting')
+            return
+        self.dhtrebuilt()
+
+                
+    def dhtrebuilt(self):
+        self.mport_msg_sent = {"command": "dht-rebuilt", "peername": self.name, "leadername": self.DHT_rn_name, "seq":self.m_seq}
+        self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
+        self.m_seq = self.m_seq + 1
+        self.recv_from_manager()            
+        status_com = self.mport_communication_status
+        if status_com != "DONE": #TO DO: later handle case for packet corruption
+            print('Error in communication with manager, quitting')
+            return
+        status_code = self.mport_msg_received["status_code"]
+        print(f'Status code of {status_code} received from the manager in response to dht-rebuilt command')
+        
+
+    def resetid(self, request): #running on p-thread
+        #needs an id to specify which id to set self.dht_id to
+        #re-orders it's DHT_memberlist according to id reset
+        #if operation=="join", adds the (name, ipv4, pport) tuple in field S_state to member_list
+        #if operation=="leave", remove the tuple from member_list
+        #if self.dht_id is n-1, and op is "join", adds joiner as rn, send 'SUCCESS' to joiner along with DHT_size, year and re-ordered member-list
+        #if self.dht_id is n-1, and op is "leave", adds node id 0 in reordered list as rn and send 'SUCCESS' to leaver
+        #if self.dht-id is 0, sets self.dht_status as 'Leader'
+        msg_recv, peer_addr = request
+        S_state = tuple(msg_recv["S_state"]) #state of joiner or leaver
+        id = int(msg_recv["id"]) #id to set
+        seq = msg_recv["seq"] 
+        op = msg_recv["op"] #join or leave
+        n = self.DHT_num_members
+
+        #reorder member list
+        leader_id = self.dht_id - id
+        if leader_id < 0:
+            leader_id = n + leader_id
+        
+        memberlist = self.DHT_memberlist[leader_id:]
+        memberlist.extend(self.DHT_memberlist[:leader_id])
+        self.DHT_memberlist = memberlist
+        
+        #append to or delete from memberlist
+        if op == "join":
+            self.DHT_memberlist.append(S_state)
+            self.DHT_num_members = n + 1
+            self.dht_id = id
+            if id == n-1: #if I am supposed to be joiner's right neighbour
+                self.DHT_rn_name = S_state[0]
+                self.DHT_rn_addr = (S_state[1], S_state[2])
+                msg_to_send = {"format":"response", "status_code":"SUCCESS", "command":"reset-id", "seq":seq, "id":n, "d":self.DHT_rn_addr, "s":(self.ipv4, self.pport), "memberlist":self.DHT_memberlist, "year":self.DHT_year, "hash_size":self.DHT_size} #Saadr: sending peer's address
+                self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), self.DHT_rn_addr)
+                print(f'resetid completed at id {self.dht_id}, sending success msg {msg_to_send} to joiner {self.DHT_rn_name} at address {self.DHT_rn_addr}')
+                return
+            if id == 0:
+                self.dht_status = "Leader"
+        if op == "leave":
+            leaving_peer_state = self.DHT_memberlist.pop() #left neighbour becomes last element 
+            self.DHT_num_members = self.DHT_num_members - 1
+            self.dht_id = id
+            if id == n-2: #arrived at the leaving peer's left neighbour
+                leader_state = self.DHT_memberlist[0]
+                self.DHT_rn_name = leader_state[0]
+                self.DHT_rn_addr = (leader_state[1], leader_state[2])
+                leaving_peer_addr = (leaving_peer_state[1], leaving_peer_state[2])
+                msg_to_send = {"format":"response", "status_code":"SUCCESS", "command":"reset-id", "seq":seq, "d":leaving_peer_addr, "s":(self.ipv4, self.pport)}
+                self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), leaving_peer_addr)
+                print(f'resetid completed at id {self.dht_id}, sending success msg to leaver {leaving_peer_state[0]} at address {leaving_peer_addr}')
+                return
+        id = id + 1
+        msg_recv.update(id=id)
+        msg_recv.update(d=self.DHT_rn_addr)
+        self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), self.DHT_rn_addr)
+        print(f'resetid {id-1} completed at id {self.dht_id}, forwarding resetid {id} to peer {self.DHT_rn_name} at address {self.DHT_rn_addr}')
+
+    def teardown(self, request):
+        msg_recv, peer_addr = request
+        self.localDHT.clear()
+        seq = msg_recv["seq"]
+        stop = int(msg_recv["stop"])
+        Saddr = tuple(msg_recv["Saddr"])
+        if self.dht_id == stop:
+            msg_to_send = {"format":"response", "status_code":"SUCCESS", "command":"teardown", "seq":seq, "d":Saddr, "s":(self.ipv4, self.pport)}
+            self.p_socket.sendto((json.dumps(msg_to_send).encode('utf-8')), Saddr)
+            print(f'teardown completed at id {self.dht_id}, sending success msg to leaver at address {Saddr}')
+            return
+
+        msg_recv.update(d=self.DHT_rn_addr)
+        self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), self.DHT_rn_addr)
+        print(f'teardown completed at id {self.dht_id}, forwarding teardown to peer {self.DHT_rn_name} at address {self.DHT_rn_addr}')
+
+    def rebuilddht(self, request):
+        msg_recv, peer_addr = request
+        seq = msg_recv["seq"]
+        if self.dht_id != 0:
+            print('I am not leader, I cannot handle this command request!')
+            return
+        msg_to_send = {"format":"response", "command": "rebuild-dht", "seq":seq, "status_code":""}
+        path = Path(__file__).parent / f"details-{self.DHT_year}.csv"
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)             
+        self.DHT_size = self.calc_s(len(df))
+        NACK_peers = self.DHT_data(df) #load and distribute dataset using store command
+        if NACK_peers:
+            print('All peer ACKs not received, so DHT not fully REBUILT')
+            msg_to_send.update(status_code="FAILURE")
+            self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), peer_addr)
+        else:
+            print('Signalling sender of completion')
+            msg_to_send.update(status_code="SUCCESS")
+            self.p_socket.sendto((json.dumps(msg_recv).encode('utf-8')), peer_addr)
         
     def read_CLI(self):
+        print("Peer process started. Please enter the message to be sent to the manager")
         while True:
             try:
-                print("Peer process started. Please enter the message to be sent to the manager")
                 CLI_instr = input("peer> ") #returns on a newline
             except(EOFError):
                 print('EOF encountered, exiting CLI mode')
@@ -355,7 +858,7 @@ class Peer:
                 continue
 
             command = CLI_list[0]
-            handler = self.handlers.get(command)
+            handler = self.m_handlers.get(command)
             if not handler:
                 print(f"Invalid command: {command} was passed")
                 continue
@@ -371,5 +874,7 @@ def main(): #module level function (outside Peer class)
     peer = Peer(manager_addr) #make an instance of peer
     peer.read_CLI()
 
-        
+if __name__ == "__main__":
+    main()
+
             
