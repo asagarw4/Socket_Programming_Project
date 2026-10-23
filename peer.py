@@ -343,7 +343,7 @@ class Peer:
                         self.pport_recv_response.remove(response) #Ideally, should delete all duplicate req, but costlier
                         requests.remove(request)
                         if ret_res == True:
-                            print(f"response {response} to store command received")
+                            print(f"response {response} to command {command} received")
                             responses.append(response)
                         break #response matched with a request, move onto next response
                             
@@ -679,7 +679,7 @@ class Peer:
         print(f'rebuild-dht request sent by {self.name} to peer {self.DHT_rn_name}')
         n = self.DHT_num_members
         stime = n*(n+1)
-        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], stime+5, 0, ret_res=True)
+        requests, responses = self.check_response_peer("rebuild-dht", [(msg_to_send, self.DHT_rn_addr)], stime+50, 0, ret_res=True)
         if requests or not responses:
             print('No rebuild response received, check pport connections and try again')
             return
@@ -959,6 +959,10 @@ def main(): #module level function (outside Peer class)
 
 if __name__ == "__main__":
     main()
+
+
+
+            
 
 
 
