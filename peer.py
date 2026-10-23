@@ -304,6 +304,8 @@ class Peer:
                 #pos is a key to a list of (clashing) entries, and each entry is itself a list
         response_msg = {"format":"response", "command": "store", "seq":request[0]["seq"], "id":self.dht_id} #new command for p2p, denotes ACK
         self.p_socket.sendto((json.dumps(response_msg)).encode('utf-8'), self.DHT_rn_addr)
+        if len(self.localDHT)//300 == 0
+            print('300 more positions stored in localDHT')
 
     def dhtcomplete(self):
         self.mport_msg_sent = {"command": "dht-complete", "peername": self.name, "seq":self.m_seq}
@@ -689,6 +691,7 @@ class Peer:
         if not status_code == "SUCCESS":
             print('Rebuild of dht unsuccessful, quitting')
             return
+        print(f'Successful rebuilt message received from leader, sending dht-rebuilt to manager nominating {self.DHT_rn_name} as leader')
         self.mport_msg_sent = {"command": "dht-rebuilt", "peername": self.name, "leadername": self.DHT_rn_name, "seq":self.m_seq}
         self.m_socket.sendto((json.dumps(self.mport_msg_sent)).encode('utf-8'),self.manager_addr)
         self.m_seq = self.m_seq + 1
@@ -702,7 +705,7 @@ class Peer:
 
     def leavedht(self, CLI_list): #running on main thread
         if not len(CLI_list) == 2:
-            print('join-dht needs 1 command line parameters')
+            print('leave-dht needs 1 command line parameters')
             return
         name = CLI_list[1]
         if not name == self.name:
