@@ -131,7 +131,7 @@ class Manager:
             v[0] = 'InDHT'
             self.peer_state.update({name: v}) #change member state to InDHT
             self.DHT_members.append((name, v[1], v[3])) #appending chosen member tuples to DHT_members list
-            print(f'Member {name}: id {i}, ipv4 {v[1]}, pport {v[3]}\n')
+            print(f'Member {name}: id {i+1}, ipv4 {v[1]}, pport {v[3]}\n')
         self.DHT_num_members = len(self.DHT_members)
         self.DHT_setup = "IN PROGRESS"
         self.msg_to_send.update(status_code='SUCCESS')
